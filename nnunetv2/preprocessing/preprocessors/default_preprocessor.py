@@ -409,74 +409,70 @@ class DefaultPreprocessor(object):
                     remaining = [i for i in remaining if i not in done]
                     sleep(0.1)
 
-    def modify_seg_fn(self, seg: np.ndarray, plans_manager: PlansManager, dataset_json: dict,
-                      configuration_manager: ConfigurationManager) -> np.ndarray:
-        from scipy.ndimage import label, distance_transform_edt
+
+    def modify_seg_fn(self, seg: np.ndarray, plans_manager: "PlansManager", dataset_json: dict,
+                    configuration_manager: "ConfigurationManager") -> np.ndarray:
+        
         import numpy as np
-        # TODO - Make this available in 3D as well
-        binary_2d = seg[0, 0]
-        binary_2d[binary_2d == -1] = 0 # TODO - Sometimes this function receives a binary label. but the unique values are actually -1, 0, 1
-        # 2. Connected Component Analysis (2D)
-        # 8-connectivity structure for 2D: np.ones((3, 3))
-        instance_map_2d, num_instances = label(
-            binary_2d, 
-            structure=np.ones((3, 3), dtype=bool)
-        )
+        from scipy.ndimage import label, distance_transform_edt
+        # seg shape is typically (C, Y, X) for 2D or (C, Z, Y, X) for 3D.
+        # We extract the first channel (assumed to be the main binary mask)
+        binary_nd = seg[0].copy() 
+        
+        # Set ignore regions to 0 (background) for calculations
+        binary_nd[binary_nd == -1] = 0 
+        
+        # 1. Connected Component Analysis (N-D)
+        # Dynamically create an 8-connected (2D) or 26-connected (3D) structure
+        ndim = binary_nd.ndim
+        structure = np.ones((3,) * ndim, dtype=bool)
+        
+        instance_map_nd, num_instances = label(binary_nd, structure=structure)
 
         if num_instances > 0:
-            # 3. Voronoi Tessellation (2D)
-            background_mask = (instance_map_2d == 0)
+            # 2. Voronoi Tessellation (N-D)
+            background_mask = (instance_map_nd == 0)
+            # distance_transform_edt natively returns N-D indices
             _, nearest_coords = distance_transform_edt(background_mask, return_indices=True)
-            voronoi_map_2d = instance_map_2d[tuple(nearest_coords)]
+            # tuple(nearest_coords) cleanly unpacks the N-dimensional coordinate arrays
+            voronoi_map_nd = instance_map_nd[tuple(nearest_coords)]
         else:
-            voronoi_map_2d = np.zeros_like(instance_map_2d)
+            voronoi_map_nd = np.zeros_like(instance_map_nd)
 
-        # 4. Reshape back to (1, 1, Y, X) matching input channel dimensions
-        instance_map = instance_map_2d[None, None, ...].astype(seg.dtype)
-        voronoi_map = voronoi_map_2d[None, None, ...].astype(seg.dtype)
-        # Extract unique values
-        instance_unique = np.unique(instance_map_2d)
-        voronoi_unique = np.unique(voronoi_map_2d)
+        # --- Sanity Checks ---
+        instance_unique = np.unique(instance_map_nd)
+        voronoi_unique = np.unique(voronoi_map_nd)
+        N = int(instance_map_nd.max())
 
-        # N is determined by the max instance label (since labels are 1..N)
-        N = int(instance_map_2d.max())
-
-        # --- Instance Map Verification ---
-        # 1. Total unique labels must equal N + 1 (0 through N)
-        assert len(instance_unique) == N + 1, (
+        # Instance Map Verification
+        assert len(instance_unique) == N + 1, \
             f"Instance map non-contiguous: expected {N+1} labels, got {len(instance_unique)}"
-        )
-        # 2. Min label must be 0 (background) and max must be N
         assert instance_unique.min() == 0, f"Instance map min is {instance_unique.min()}, expected 0"
         assert instance_unique.max() == N, f"Instance map max is {instance_unique.max()}, expected {N}"
-        # 3. All integer values from 0 to N must be present
-        assert np.array_equal(instance_unique, np.arange(N + 1)), (
+        assert np.array_equal(instance_unique, np.arange(N + 1)), \
             f"Instance map missing labels in range 0..{N}: {instance_unique}"
-        )
 
-
-        # --- Voronoi Map Verification ---
+        # Voronoi Map Verification
         if N > 0:
-            # 1. Total unique Voronoi entries must equal N
-            assert len(voronoi_unique) == N, (
+            assert len(voronoi_unique) == N, \
                 f"Voronoi map mismatch: expected {N} region IDs, got {len(voronoi_unique)}"
-            )
-            # 2. Values must be strictly 1..N (no background zeros remaining)
             assert voronoi_unique.min() == 1, f"Voronoi min is {voronoi_unique.min()}, expected 1"
             assert voronoi_unique.max() == N, f"Voronoi max is {voronoi_unique.max()}, expected {N}"
-            assert np.array_equal(voronoi_unique, np.arange(1, N + 1)), (
+            assert np.array_equal(voronoi_unique, np.arange(1, N + 1)), \
                 f"Voronoi map missing instance IDs in range 1..{N}: {voronoi_unique}"
-            )
         else:
-            # Edge Case: N = 0
-            assert len(voronoi_unique) == 1 and voronoi_unique[0] == 0, (
+            assert len(voronoi_unique) == 1 and voronoi_unique[0] == 0, \
                 f"Voronoi map should be all zeros when N=0, got {voronoi_unique}"
-            )
-        # 5. Concatenate along channel axis (axis 0) -> resulting shape (3, 1, 768, 1024)
+
+        # 3. Reshape back matching input channel dimensions by adding a single channel axis
+        instance_map = instance_map_nd[None, ...].astype(seg.dtype)
+        voronoi_map = voronoi_map_nd[None, ...].astype(seg.dtype)
+
+        # 4. Concatenate along channel axis (axis 0)
+        # Output shape will be (Original_C + 2, Z, Y, X) or (Original_C + 2, Y, X)
         new_seg = np.concatenate([seg, instance_map, voronoi_map], axis=0)
         
         return new_seg
-
 
 def example_test_case_preprocessing():
     # (paths to files may need adaptations)
