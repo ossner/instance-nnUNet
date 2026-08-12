@@ -415,7 +415,7 @@ class DefaultPreprocessor(object):
         import numpy as np
         # TODO - Make this available in 3D as well
         binary_2d = seg[0, 0]
-    
+        binary_2d[binary_2d == -1] = 0 # TODO - Sometimes this function receives a binary label. but the unique values are actually -1, 0, 1
         # 2. Connected Component Analysis (2D)
         # 8-connectivity structure for 2D: np.ones((3, 3))
         instance_map_2d, num_instances = label(
