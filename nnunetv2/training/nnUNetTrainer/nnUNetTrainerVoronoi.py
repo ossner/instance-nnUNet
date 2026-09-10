@@ -94,8 +94,8 @@ class DC_CE_and_Voronoi_Loss(nn.Module):
         self, 
         soft_dice_kwargs: dict, 
         ce_kwargs: dict, 
-        weight_global: float = 1.0, 
-        weight_voronoi: float = 1.0
+        weight_global: float = 1, 
+        weight_voronoi: float = 1
     ):
         super().__init__()
         # Standard global loss calculated over the padded image
@@ -135,8 +135,8 @@ class nnUNetTrainerVoronoi(nnUNetTrainer):
             ce_kwargs={
                 'ignore_index': self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -100
             },
-            weight_global=1.0,
-            weight_voronoi=1.0  # Adjust weights here as desired
+            weight_global=0.5,
+            weight_voronoi=0.5  # Adjust weights here as desired
         )
 
         if self.enable_deep_supervision:
@@ -160,7 +160,8 @@ class nnUNetTrainerVoronoi(nnUNetTrainer):
             target = [t.to(self.device, non_blocking=True) for t in target]
         else:
             target = target.to(self.device, non_blocking=True)
-
+        
+        # TODO: This prevents a strange metric tracking crash, should be investigated further
         # 1. Forward pass & multi-channel loss evaluation
         with torch.no_grad():
             with torch.autocast(self.device.type, enabled=True):
