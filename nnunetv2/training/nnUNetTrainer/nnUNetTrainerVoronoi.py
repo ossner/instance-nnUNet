@@ -68,7 +68,7 @@ class VoronoiRegionLoss(nn.Module):
         region_ce = ce_sum[:, 1:] / (region_counts[:, 1:] + 1e-8)
         
         # Region Dice
-        cardinality = sum_p[:, 1:] + sum_t[:, 1:]
+        cardinality = sum_p[:, 1:] + sum_t[:, 1:] # Not using squared denominator - sensible?
         region_dice = 1.0 - (2.0 * intersection[:, 1:] + self.eps) / (cardinality + self.eps)
 
         # Combine
@@ -94,16 +94,17 @@ class DC_CE_and_Voronoi_Loss(nn.Module):
         self, 
         soft_dice_kwargs: dict, 
         ce_kwargs: dict, 
-        weight_global: float = 1, 
-        weight_voronoi: float = 1
+        weight_global: float = 1.0, 
+        weight_voronoi: float = 1.0
     ):
         super().__init__()
         # Standard global loss calculated over the padded image
         self.global_loss = DC_and_CE_loss(soft_dice_kwargs, ce_kwargs, weight_ce=1.0, weight_dice=1.0)
         self.voronoi_loss = VoronoiRegionLoss()
         
-        self.weight_global = weight_global
-        self.weight_voronoi = weight_voronoi
+        total_weight = weight_global + weight_voronoi
+        self.weight_global = weight_global / total_weight
+        self.weight_voronoi = weight_voronoi / total_weight
 
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """

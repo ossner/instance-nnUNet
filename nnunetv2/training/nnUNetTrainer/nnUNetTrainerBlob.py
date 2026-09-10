@@ -67,14 +67,16 @@ class DC_CE_and_Blob_Loss(nn.Module):
         self, 
         soft_dice_kwargs: dict, 
         ce_kwargs: dict, 
-        weight_dc_ce: float = 1.0, 
+        weight_global: float = 1.0, 
         weight_blob: float = 1.0
     ):
         super().__init__()
         self.dc_ce = DC_and_CE_loss(soft_dice_kwargs, ce_kwargs, weight_ce=1.0, weight_dice=1.0)
         self.blob_loss = BlobLoss()
-        self.weight_dc_ce = weight_dc_ce
-        self.weight_blob = weight_blob
+        
+        total_weight = weight_global + weight_blob
+        self.weight_dc_ce = weight_global / total_weight
+        self.weight_blob = weight_blob / total_weight
 
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
