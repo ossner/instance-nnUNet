@@ -24,6 +24,24 @@ class nnUNetTrainerBenchmark_5epochs(nnUNetTrainer):
         # do not trust people to remember that self.disable_checkpointing must be True for this trainer
         pass
 
+    def train_step(self, batch: dict) -> dict:
+        # Strip targets down to Channel 0 (Binary Semantic Mask)
+        if isinstance(batch['target'], list):
+            batch['target'] = [t[:, 0:1] for t in batch['target']]
+        else:
+            batch['target'] = batch['target'][:, 0:1]
+            
+        # Call standard nnUNet train step with purely binary targets
+        return super().train_step(batch)
+    
+    def validation_step(self, batch: dict) -> dict:
+        # Strip targets down to Channel 0 (Binary Semantic Mask)
+        if isinstance(batch['target'], list):
+            batch['target'] = [t[:, 0:1] for t in batch['target']]
+        else:
+            batch['target'] = batch['target'][:, 0:1]
+        return super().validation_step(batch)
+
     def run_training(self):
         try:
             super().run_training()
