@@ -59,7 +59,7 @@ class VoronoiRegionLoss(nn.Module):
         sum_p.scatter_add_(1, t_vor_flat, p_fg_flat)
         sum_t.scatter_add_(1, t_vor_flat, t_bin_flat)
 
-        # 6. Exclude Region 0 (Slice out the first column)
+        # 6. Exclude Region 0 (Slice out the first column) all voxels with 0 have been added during padding
         # Tensors become shape: [B, max_id - 1]
         valid_mask = region_counts[:, 1:] > 0
         
@@ -136,8 +136,8 @@ class nnUNetTrainerVoronoi(nnUNetTrainer):
             ce_kwargs={
                 'ignore_index': self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -100
             },
-            weight_global=0.5,
-            weight_voronoi=0.5  # Adjust weights here as desired
+            weight_global=1,
+            weight_voronoi=1  # Adjust weights here as desired
         )
 
         if self.enable_deep_supervision:
@@ -182,17 +182,13 @@ class nnUNetTrainerVoronoi(nnUNetTrainer):
         
         probs = torch.softmax(output_eval, dim=1)
         # Take just the foreground class for metric validation
-        probs = probs[:, 1:2] 
+        probs = probs[:, 1:2]
 
         tp, fp, fn, _ = get_tp_fp_fn_tn(probs, binary_target_eval, axes=axes)
 
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
-
         return {
             'loss': l.detach().cpu().numpy(),
-            'tp_hard': tp_hard,
-            'fp_hard': fp_hard,
-            'fn_hard': fn_hard
+            'tp_hard': tp.detach().cpu().numpy(),
+            'fp_hard': fp.detach().cpu().numpy(),
+            'fn_hard': fn.detach().cpu().numpy(),
         }

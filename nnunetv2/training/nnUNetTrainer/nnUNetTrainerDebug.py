@@ -19,7 +19,6 @@ class nnUNetTrainerDebug(nnUNetTrainer):
     ):
         """used for debugging plans etc"""
         super().__init__(plans, configuration, fold, dataset_json, device)
-        self.num_epochs = 500
         
         
     def train_step(self, batch: dict) -> dict:

@@ -7,61 +7,62 @@ from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 
-class BlobLoss(nn.Module):
+
+class VectorizedBlobLoss(nn.Module):
     """
-    Instance-aware Blob Loss (Kofler et al.)
-    
-    Computes Dice loss individually for each connected component / instance present in 
-    the ground truth instance map. This prevents small objects/blobs from being 
-    dominated by large background regions during gradient updates.
+    Vectorized Instance-aware Blob Loss (Kofler et al.)
+    Computes per-instance Dice loss using GPU scatter_add_ operations.
     """
     def __init__(self, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
 
     def forward(self, net_output: torch.Tensor, instance_target: torch.Tensor) -> torch.Tensor:
-        """
-        net_output: [B, 1, H, W] or [B, 1, D, H, W] (raw logits)
-        instance_target: [B, 1, H, W] or [B, 1, D, H, W] (0=BG, 1..N=Instance IDs)
-        """
-        probs = torch.sigmoid(net_output)
+        # Standardize foreground probability extraction
+        if net_output.shape[1] == 2:
+            probs_fg = torch.softmax(net_output, dim=1)[:, 1]
+        else:
+            probs_fg = torch.sigmoid(net_output)[:, 0]
+
+        B = net_output.shape[0]
         
-        total_blob_loss = 0.0
-        total_blobs = 0
-        batch_size = net_output.shape[0]
+        # Flatten spatial dimensions -> Shape: [B, N_pixels]
+        p_fg_flat = probs_fg.view(B, -1)
+        t_inst_flat = instance_target[:, 0].long().view(B, -1)
 
-        for b in range(batch_size):
-            p_b = probs[b, 0]
-            inst_b = instance_target[b, 0]
+        # Allocate dynamic buffers on GPU
+        max_id = int(t_inst_flat.max().item()) + 1
+        if max_id <= 1:  # Only background present
+            return (net_output * 0).sum()
 
-            # Identify unique instance IDs for the current sample (excluding background 0)
-            unique_insts = torch.unique(inst_b)
-            unique_insts = unique_insts[unique_insts > 0]
+        device = net_output.device
+        dtype = p_fg_flat.dtype
 
-            if len(unique_insts) == 0:
-                continue
+        intersection = torch.zeros((B, max_id), device=device, dtype=dtype)
+        instance_sizes = torch.zeros((B, max_id), device=device, dtype=dtype)
 
-            for inst_id in unique_insts:
-                mask = (inst_b == inst_id).float()
-                
-                # Instance-specific dice term
-                intersection = torch.sum(p_b * mask)
-                cardinality = torch.sum(p_b * mask) + torch.sum(mask)
-                
-                blob_dice = (2.0 * intersection + self.eps) / (cardinality + self.eps)
-                total_blob_loss += (1.0 - blob_dice)
-                total_blobs += 1
+        # Massively parallel group-by sums
+        intersection.scatter_add_(1, t_inst_flat, p_fg_flat)
+        instance_sizes.scatter_add_(1, t_inst_flat, torch.ones_like(p_fg_flat))
 
-        if total_blobs == 0:
-            return torch.tensor(0.0, device=net_output.device, dtype=net_output.dtype, requires_grad=True)
+        # Exclude Background (Instance ID 0) -> Shape: [B, max_id - 1]
+        valid_mask = instance_sizes[:, 1:] > 0
+        
+        # Compute individual instance Dice
+        cardinality = intersection[:, 1:] + instance_sizes[:, 1:]
+        blob_dice = (2.0 * intersection[:, 1:] + self.eps) / (cardinality + self.eps)
+        blob_loss = 1.0 - blob_dice
 
-        return total_blob_loss / total_blobs
+        total_valid_blobs = valid_mask.sum()
+        if total_valid_blobs == 0:
+            return (net_output * 0).sum()
+
+        return (blob_loss * valid_mask).sum() / total_valid_blobs
 
 
 class DC_CE_and_Blob_Loss(nn.Module):
     """
-    Compound Loss: Combines Standard DC + CE Loss (on Channel 0: Binary Target)
-    with Blob Loss (on Channel 1: Instance Target).
+    Compound Loss: Standard DC + CE Loss (Binary) + Instance Blob Loss.
     """
     def __init__(
         self, 
@@ -71,31 +72,31 @@ class DC_CE_and_Blob_Loss(nn.Module):
         weight_blob: float = 1.0
     ):
         super().__init__()
-        self.dc_ce = DC_and_CE_loss(soft_dice_kwargs, ce_kwargs, weight_ce=1.0, weight_dice=1.0)
-        self.blob_loss = BlobLoss()
+        self.global_loss = DC_and_CE_loss(soft_dice_kwargs, ce_kwargs, weight_ce=1.0, weight_dice=1.0)
+        self.blob_loss = VectorizedBlobLoss()
         
+        # Normalize weights so they sum to 1.0
         total_weight = weight_global + weight_blob
-        self.weight_dc_ce = weight_global / total_weight
+        self.weight_global = weight_global / total_weight
         self.weight_blob = weight_blob / total_weight
 
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        target: multi-channel tensor where:
-            target[:, 0:1] -> Binary Semantic Target
-            target[:, 1:2] -> Instance ID Map
+        target[:, 0:1] -> Binary target
+        target[:, 1:2] -> Instance ID
+        target[:, 2:3] -> Voronoi target (Unused here, but retained for indexing consistency)
         """
         binary_target = target[:, 0:1]
         instance_target = target[:, 1:2]
 
-        l_dc_ce = self.dc_ce(net_output, binary_target)
+        l_global = self.global_loss(net_output, binary_target)
         l_blob = self.blob_loss(net_output, instance_target)
-        return (self.weight_dc_ce * l_dc_ce) + (self.weight_blob * l_blob)
+        return (self.weight_global * l_global) + (self.weight_blob * l_blob)
 
 
 class nnUNetTrainerBlob(nnUNetTrainer):
     """
-    nnUNetv2 Trainer integrating Kofler et al. Blob Loss with Deep Supervision support.
-    Handles multi-channel targets safely across training and validation steps.
+    nnUNetv2 Trainer integrating vectorized Blob Loss.
     """
     def _build_loss(self):
         loss = DC_CE_and_Blob_Loss(
@@ -108,7 +109,7 @@ class nnUNetTrainerBlob(nnUNetTrainer):
             ce_kwargs={
                 'ignore_index': self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -100
             },
-            weight_dc_ce=1.0,
+            weight_global=1.0,
             weight_blob=1.0
         )
 
@@ -121,7 +122,6 @@ class nnUNetTrainerBlob(nnUNetTrainer):
         return loss
 
     def train_step(self, batch: dict) -> dict:
-        # Keep multi-channel target intact for loss computation
         return super().train_step(batch)
 
     def validation_step(self, batch: dict) -> dict:
@@ -134,33 +134,29 @@ class nnUNetTrainerBlob(nnUNetTrainer):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        # 1. Forward pass & Multi-channel Loss computation
         with torch.no_grad():
             with torch.autocast(self.device.type, enabled=True):
                 output = self.network(data)
                 del data
                 l = self.loss(output, target)
 
-        # 2. Extract full-resolution scale (index 0) for metric calculation
         output_eval = output[0] if isinstance(output, (list, tuple)) else output
-        target_eval = target[0] if isinstance(target, (list, tuple)) else target
+        target_eval = target[0] if isinstance(output, (list, tuple)) else target
 
-        # 3. Slice target to Channel 0 (Binary target only)
         binary_target_eval = target_eval[:, 0:1]
 
-        # 4. Compute metrics using get_tp_fp_fn_tn from nnunetv2.training.loss.dice
-        axes = tuple(range(2, output_eval.ndim))  # Spatial axes (H, W) or (D, H, W)
-        probs = torch.sigmoid(output_eval)
+        # Standardize evaluation metrics extraction
+        axes = tuple(range(2, output_eval.ndim))
+        
+        probs = torch.softmax(output_eval, dim=1)
+        # Take just the foreground class for metric validation
+        probs = probs[:, 1:2]
 
         tp, fp, fn, _ = get_tp_fp_fn_tn(probs, binary_target_eval, axes=axes)
 
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
-
         return {
             'loss': l.detach().cpu().numpy(),
-            'tp_hard': tp_hard,
-            'fp_hard': fp_hard,
-            'fn_hard': fn_hard
+            'tp_hard': tp.detach().cpu().numpy(),
+            'fp_hard': fp.detach().cpu().numpy(),
+            'fn_hard': fn.detach().cpu().numpy()
         }
